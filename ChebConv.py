@@ -1,19 +1,10 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import init
 import numpy as np
 import scipy.sparse as sp
 
-
-"""
-@inproceedings{wu2021graph,
-title={Graph-based 3d multi-person pose estimation using multi-view images},
-author={Wu, Size and Jin, Sheng and Liu, Wentao and Bai, Lei and Qian, Chen and Liu, Dong and Ouyang, Wanli},
-booktitle={Proceedings of the IEEE/CVF international conference on computer vision},
-pages={11148--11157},
-year={2021}
-}
-"""
 
 def normalize(mx):
     """Row-normalize sparse matrix"""
@@ -77,11 +68,15 @@ class ChebConv(nn.Module):
         :param graph: the graph structure, [N, N]
         :return: convolution result, [B, N, D]
         """
-        L = ChebConv.get_laplacian(graph, self.normalize).to('cuda')  # [N, N]
-        mul_L = self.cheb_polynomial(L).unsqueeze(1)   # [K, 1, N, N]
         B, C, h, w = inputs.shape
-        inputs = inputs.reshape(B, h*w, C)#100,121,128
-        result = torch.matmul(mul_L, inputs)  # [K, B, N, C]
+        inputs = inputs.flatten(2).transpose(1, 2)  # [B, N, C]
+        graph = graph.to(inputs.device)
+        L = ChebConv.get_laplacian(graph, self.normalize)  # [N, N] or [B, N, N]
+        mul_L = self.cheb_polynomial(L)
+        if mul_L.dim() == 3:
+            result = torch.einsum('knm,bmc->kbnc', mul_L, inputs)
+        else:
+            result = torch.einsum('kbnm,bmc->kbnc', mul_L, inputs)
 
         result = torch.matmul(result, self.weight)  # [K, B, N, D]
         result = torch.sum(result, dim=0) + self.bias  # [B, N, D]
@@ -94,9 +89,17 @@ class ChebConv(nn.Module):
         :param laplacian: the graph laplacian
         :return: the multi order Chebyshev laplacian
         """
-        N = laplacian.size(0)  # [N, N]
-        multi_order_laplacian = torch.zeros([self.K, N, N], device=laplacian.device, dtype=torch.float)  # [K, N, N]
-        multi_order_laplacian[0] = torch.eye(N, device=laplacian.device, dtype=torch.float)
+        if laplacian.dim() == 2:
+            N = laplacian.size(0)  # [N, N]
+            multi_order_laplacian = torch.zeros([self.K, N, N], device=laplacian.device,
+                                                dtype=laplacian.dtype)  # [K, N, N]
+            multi_order_laplacian[0] = torch.eye(N, device=laplacian.device, dtype=laplacian.dtype)
+        else:
+            B, N, _ = laplacian.shape  # [B, N, N]
+            multi_order_laplacian = torch.zeros([self.K, B, N, N], device=laplacian.device,
+                                                dtype=laplacian.dtype)  # [K, B, N, N]
+            multi_order_laplacian[0] = torch.eye(N, device=laplacian.device,
+                                                 dtype=laplacian.dtype).unsqueeze(0)
 
         if self.K == 1:
             return multi_order_laplacian
@@ -106,7 +109,7 @@ class ChebConv(nn.Module):
                 return multi_order_laplacian
             else:
                 for k in range(2, self.K):
-                    multi_order_laplacian[k] = 2 * torch.mm(laplacian, multi_order_laplacian[k-1]) - \
+                    multi_order_laplacian[k] = 2 * torch.matmul(laplacian, multi_order_laplacian[k-1]) - \
                                                multi_order_laplacian[k-2]
 
         return multi_order_laplacian
@@ -120,11 +123,23 @@ class ChebConv(nn.Module):
         :return: graph laplacian.
         """
         if normalize:
-            D = torch.diag(torch.sum(graph, dim=-1) ** (-1 / 2))
-            L = torch.eye(graph.size(0), device=graph.device, dtype=graph.dtype) - torch.mm(torch.mm(D, graph), D)
+            degree = torch.sum(graph, dim=-1).clamp_min(1e-6)
+            if graph.dim() == 2:
+                D = torch.diag(degree ** (-1 / 2))
+                L = torch.eye(graph.size(0), device=graph.device, dtype=graph.dtype) - torch.mm(torch.mm(D, graph), D)
+            else:
+                D = degree ** (-1 / 2)
+                norm_graph = graph * D.unsqueeze(-1) * D.unsqueeze(-2)
+                eye = torch.eye(graph.size(-1), device=graph.device, dtype=graph.dtype).unsqueeze(0)
+                L = eye - norm_graph
         else:
-            D = torch.diag(torch.sum(graph, dim=-1))
-            L = D - graph
+            degree = torch.sum(graph, dim=-1)
+            if graph.dim() == 2:
+                D = torch.diag(degree)
+                L = D - graph
+            else:
+                D = torch.diag_embed(degree)
+                L = D - graph
         return L
 
 
@@ -150,36 +165,33 @@ class _GraphConv(nn.Module):
 
 
 class _ResChebGC(nn.Module):
-    def __init__(self, input_dim, hid_dim, n_seq, p_dropout):
+    def __init__(self, input_dim, hid_dim, n_seq, p_dropout, top_k=8, temperature=0.2):
         super(_ResChebGC, self).__init__()
-        self.adj = adj_mx_from_edges(num_pts=n_seq, edges=gan_edges, sparse=False)
         self.gconv1 = _GraphConv(input_dim, hid_dim, p_dropout)
+        self.top_k = top_k
+        self.temperature = temperature
+
+    def build_dynamic_adj(self, x):
+        B, C, h, w = x.shape
+        N = h * w
+        k = min(self.top_k, N - 1)
+        nodes = x.flatten(2).transpose(1, 2)  # [B, N, C]
+        nodes = F.normalize(nodes, p=2, dim=-1)
+        sim = torch.matmul(nodes, nodes.transpose(1, 2))  # [B, N, N]
+
+        eye_mask = torch.eye(N, device=x.device, dtype=torch.bool).unsqueeze(0)
+        sim = sim.masked_fill(eye_mask, -float('inf'))
+        index = sim.topk(k=k, dim=-1).indices
+        weight = torch.gather(sim, dim=-1, index=index)
+        weight = torch.softmax(weight / self.temperature, dim=-1)
+
+        adj = torch.zeros(B, N, N, device=x.device, dtype=x.dtype)
+        adj.scatter_(-1, index, weight)
+        adj = 0.5 * (adj + adj.transpose(1, 2))
+        adj = adj + torch.eye(N, device=x.device, dtype=x.dtype).unsqueeze(0)
+        return adj
 
     def forward(self, x):
-        out = self.gconv1(x, self.adj)
+        adj = self.build_dynamic_adj(x)
+        out = self.gconv1(x, adj)
         return out
-
-
-class ChebNet(nn.Module):
-    def __init__(self, input_dim, output_dim, hid_dim, n_seq, p_dropout):
-        super(ChebNet, self).__init__()
-        self.adj = adj_mx_from_edges(num_pts=n_seq, edges=body_edges, sparse=False)
-        self.gconv1 = _GraphConv(input_dim, hid_dim, p_dropout)
-        self.gconv2 = _GraphConv(hid_dim, output_dim, p_dropout)
-
-    def forward(self, x):
-        out = self.gconv1(x, self.adj)
-        out = self.gconv2(out, self.adj)
-        return out
-
-gan_edges = torch.tensor([[0, 1], [1, 2], [2, 3], [3, 4],
-                          [0, 5], [5, 6], [6, 7], [7, 8],
-                          [0, 9], [9, 10], [10, 11], [11, 12],
-                          [0, 13], [13, 14], [14, 15], [15, 16],
-                          [0, 17], [17, 18], [18, 19], [19, 20]], dtype=torch.long)
-
-body_edges = torch.tensor([[0, 1], [1, 2], [2, 3],
-                         [0, 4], [4, 5], [5, 6],
-                         [0, 7], [7, 8], [8, 9], 
-                         [8, 10], [10, 11], [11, 12],
-                         [8, 13], [13, 14], [14, 15]], dtype=torch.long)
