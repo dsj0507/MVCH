@@ -85,10 +85,7 @@ class DPSF(nn.Module):
         return output
 
     def ssm(self, x):
-        """Runs the SSM.
-        Official Implementation:
-            mamba_inner_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L311
-        """
+
         (d_in, n) = self.A_log.shape
 
         # Compute ∆ A B C D, the state space parameters.
@@ -118,14 +115,7 @@ class DPSF(nn.Module):
             C: shape (b, l, n)
             D: shape (d_in,)
 
-        Returns:
-            output: shape (b, l, d_in)
 
-        Official Implementation:
-            selective_scan_ref(), https://github.com/state-spaces/mamba/blob/main/mamba_ssm/ops/selective_scan_interface.py#L86
-            Note: I refactored some parts out of `selective_scan_ref` out, so the functionality doesn't match exactly.
-
-        """
         (b, l, d_in) = u.shape
         n = A.shape[1]
 
